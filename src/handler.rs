@@ -128,7 +128,7 @@ pub async fn handle(req: Request<Body>) -> Response<Body> {
     };
 
     // Body > 256KB: Error
-    if json_body.len() > 256000 {
+    if json_body.len() >= 256000 {
         log("error", "Error: message body > 256 kbytes".to_string());
         return build_error("Body too long".to_string());
     }
