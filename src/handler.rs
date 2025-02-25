@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime};
 
 // Version string for debugging, because deployment sometimes
 // seems to fail quietly
-const VERSION: u8 = 7;
+const VERSION: u8 = 8;
 
 // Format of the message that will be added to
 // the queue as a JSON string
@@ -128,8 +128,8 @@ pub async fn handle(req: Request<Body>) -> Response<Body> {
     };
 
     // Body > 256KB: Error
-    if json_body.len() > 256 {
-        log("error", "Error: message body > 256 bytes".to_string());
+    if json_body.len() > 256000 {
+        log("error", "Error: message body > 256 kbytes".to_string());
         return build_error("Body too long".to_string());
     }
 
