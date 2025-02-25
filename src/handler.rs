@@ -1,23 +1,48 @@
+use aws_sdk_sqs::Client;
 use axum::{
-    body::{to_bytes, Body}, extract::Request, response::Response,
+    body::{to_bytes, Body},
+    extract::Request,
+    response::Response,
 };
 use http::StatusCode;
-use aws_sdk_sqs::Client;
+use serde::{Deserialize, Serialize};
 use std::env;
+use std::time::{Duration, SystemTime};
 
-// Version string for debugging
-const VERSION: u8 = 1;
+// Version string for debugging, because deployment sometimes
+// seems to fail quietly
+const VERSION: u8 = 7;
+
+// Format of the message that will be added to
+// the queue as a JSON string
+#[derive(Serialize, Deserialize)]
+struct QueueMessage {
+    received: u64,
+    from: String,
+    body: String,
+}
+
+// Just to make types easier to read
+type ErrorString = String;
 
 /// Load SQS Queue client
 async fn get_client() -> Client {
     dotenv::dotenv().ok();
-    let config = aws_config::from_env().endpoint_url("https://sqs.mnq.nl-ams.scaleway.com").load().await;
+    let config = aws_config::from_env()
+        .endpoint_url("https://sqs.mnq.nl-ams.scaleway.com")
+        .load()
+        .await;
     let client = Client::new(&config);
     client
 }
 
+/// Format log message
+fn log(log_type: &str, message: String) {
+    println!("[{:?}|v{:?}] {:?}", log_type, VERSION, message);
+}
+
 /// Return an error response
-pub fn build_error(message: String) -> Response<Body> {
+fn build_error(message: String) -> Response<Body> {
     Response::builder()
         .status(StatusCode::BAD_REQUEST)
         .header("Content-Type", "text/plain")
@@ -25,55 +50,107 @@ pub fn build_error(message: String) -> Response<Body> {
         .unwrap()
 }
 
-/// The function that gets called by Scaleway Serverless
-pub async fn handle(req: Request<Body>) -> Response<Body> {
+/// Parse and format JSON message for the queue
+async fn format_message(req: Request<Body>, timestamp: Duration) -> Result<String, ErrorString> {
+    let (parts, body) = req.into_parts();
 
-    println!("Version {:?}", VERSION);
-    println!("{:?}", req.headers().get("User-Agent"));
+    // Unwrap User Agent header
+    let user_agent_value = match parts.headers.get("User-Agent") {
+        Some(value) => value,
+        None => return Err("No user agent found".to_string()),
+    };
+
+    // Parse string
+    let user_agent = match user_agent_value.to_str() {
+        Ok(value) => value,
+        Err(err) => return Err(format!("No valid user agent found: {:?}", err)),
+    };
 
     // Unwrap body
-    let bytes_result = to_bytes(req.into_body(), usize::MAX).await;
-    if bytes_result.is_err() {
-        println!("Error: {:?}", bytes_result.err());
-        return build_error("Could not parse body".to_string());
-    }
-    let bytes = bytes_result.unwrap();
+    let bytes = match to_bytes(body, usize::MAX).await {
+        Ok(value) => value,
+        Err(err) => return Err(format!("Could not parse body: {:?}", err)),
+    };
 
     // Parse to string
-    let body_result = String::from_utf8(bytes.to_vec());
-    if body_result.is_err() {
-        println!("Error: {:?}", body_result.err());
-        return build_error("Could not parse body".to_string());
-    }
-    let body = body_result.unwrap();
+    let body = match String::from_utf8(bytes.to_vec()) {
+        Ok(value) => value,
+        Err(err) => return Err(format!("Could not parse body: {:?}", err)),
+    };
 
-    // Body > 256KB: Error
+    // Format queue message
+    let message = QueueMessage {
+        received: timestamp.as_secs(),
+        from: user_agent.to_string(),
+        body: body,
+    };
+
+    // Serialize it to a JSON string.
+    let json_body = match serde_json::to_string(&message) {
+        Ok(value) => value,
+        Err(err) => return Err(format!("Could not format JSON: {:?}", err)),
+    };
+
+    Ok(json_body)
+}
+
+/// The function that gets called by Scaleway Serverless
+pub async fn handle(req: Request<Body>) -> Response<Body> {
+    log("notice", "Processing new message".to_string());
+
+    // Get received timestamp
+    // An error should technically not return a 400
+    let timestamp: Duration = match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(timestamp) => timestamp,
+        Err(err) => {
+            log("error", format!("Error: {:?}", err));
+            return build_error("Could not get timestamp".to_string());
+        }
+    };
 
     // Fetch Queue url
-    let queue_url_result = env::var("QUEUE_URL");
-    if queue_url_result.is_err() {
-        println!("Error: {:?}", queue_url_result.err());
-        return build_error("Could not parse queue url".to_string());
+    // An error should technically not return a 400
+    let queue_url: String = match env::var("QUEUE_URL") {
+        Ok(url) => url,
+        Err(err) => {
+            log("error", format!("Error: {:?}", err));
+            return build_error("Could not parse queue url".to_string());
+        }
+    };
+
+    // Format message
+    let json_body = match format_message(req, timestamp).await {
+        Ok(body) => body,
+        Err(err) => {
+            log("error", format!("Error: {:?}", err));
+            return build_error("Could not format queue message".to_string());
+        }
+    };
+
+    // Body > 256KB: Error
+    if json_body.len() > 256 {
+        log("error", "Error: message body > 256 bytes".to_string());
+        return build_error("Body too long".to_string());
     }
-    let queue_url = queue_url_result.unwrap();
 
     // Send message to queue
     let result = get_client()
         .await
         .send_message()
-        .message_body(body)
+        .message_body(json_body)
         .queue_url(queue_url)
         .send()
         .await;
 
     if result.is_ok() {
+        log("notice", "Message added to queue.".to_string());
         Response::builder()
-        .status(StatusCode::OK)
-        .header("Content-Type", "text/plain")
-        .body(Body::from("OK"))
-        .unwrap()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain")
+            .body(Body::from("OK"))
+            .unwrap()
     } else {
-        println!("Error: {:?}", result.err());
+        log("error", format!("Error: {:?}", result.err()));
         build_error("Could not connect to queue".to_string())
     }
 }
