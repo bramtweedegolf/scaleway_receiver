@@ -690,10 +690,12 @@ dependencies = [
  "axum",
  "dotenv",
  "http 1.2.0",
+ "litemap",
  "rustc_version",
  "serde",
  "serde_json",
  "tokio",
+ "zerofrom",
 ]
 
 [[package]]

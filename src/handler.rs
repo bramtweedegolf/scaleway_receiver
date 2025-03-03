@@ -6,12 +6,13 @@ use axum::{
 };
 use http::StatusCode;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::env;
 use std::time::{Duration, SystemTime};
 
 // Version string for debugging, because deployment sometimes
 // seems to fail quietly
-const VERSION: u8 = 8;
+const VERSION: u8 = 9;
 
 // Format of the message that will be added to
 // the queue as a JSON string
@@ -19,7 +20,7 @@ const VERSION: u8 = 8;
 struct QueueMessage {
     received: u64,
     from: String,
-    body: String,
+    body: Value,
 }
 
 // Just to make types easier to read
@@ -78,11 +79,17 @@ async fn format_message(req: Request<Body>, timestamp: Duration) -> Result<Strin
         Err(err) => return Err(format!("Could not parse body: {:?}", err)),
     };
 
+    // Parse JSON
+    let json_body = match serde_json::from_str(&body) {
+        Ok(value) => value,
+        Err(err) => return Err(format!("Could not parse json body: {:?}", err)),
+    };
+
     // Format queue message
     let message = QueueMessage {
         received: timestamp.as_secs(),
         from: user_agent.to_string(),
-        body: body,
+        body: json_body,
     };
 
     // Serialize it to a JSON string.
